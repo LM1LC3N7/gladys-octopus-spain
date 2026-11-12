@@ -1,0 +1,440 @@
+[
+  {
+    "name": "any login error is a refusal",
+    "file": "src/kraken/client.js",
+    "from": "if (primary && err.kt && (REFUSED.has(err.kt) || err.kt === API_ACCESS)) {",
+    "to": "if (primary) {"
+  },
+  {
+    "name": "a query 401 taken as a refusal",
+    "file": "src/kraken/client.js",
+    "from": "if (status === 401 || status === 403) {\n    throw new KrakenError('unauthorized', { status, kt: ktOf(errors) });",
+    "to": "if (status === 401 || status === 403) {\n    throw new KrakenError('refused', { status, kt: ktOf(errors) });"
+  },
+  {
+    "name": "KT-CT-1136 not a pause",
+    "file": "src/kraken/client.js",
+    "from": "if (primary && err.kt === LOGIN_BLOCKED) {",
+    "to": "if (false) {"
+  },
+  {
+    "name": "body read whole",
+    "file": "src/kraken/client.js",
+    "from": "    if (size > max) {",
+    "to": "    if (false) {"
+  },
+  {
+    "name": "no gap between requests",
+    "file": "src/kraken/client.js",
+    "from": "if (wait > 0 && this.sleep) await this.sleep(wait);",
+    "to": ""
+  },
+  {
+    "name": "token never renewed",
+    "file": "src/kraken/client.js",
+    "from": "if (!this.token || this.monotonic() >= this.tokenDue) {",
+    "to": "if (!this.token) {"
+  },
+  {
+    "name": "password at every renewal",
+    "file": "src/kraken/client.js",
+    "from": "if (this.refreshToken && mono < this.refreshDue) {",
+    "to": "if (false) {"
+  },
+  {
+    "name": "no new login on an expired token",
+    "file": "src/kraken/client.js",
+    "from": "if (err.code !== 'expired' && !(err.code === 'unauthorized' && err.status === 401)) {",
+    "to": "if (true) {"
+  },
+  {
+    "name": "a /data time in the future taken",
+    "file": "src/app.js",
+    "from": "        data[key] <= now &&\n",
+    "to": ""
+  },
+  {
+    "name": "attempt not kept before the read",
+    "file": "src/app.js",
+    "from": "    this.data.lastAccount = this.now();\n    await this.save();",
+    "to": "    await this.save();\n    this.data.lastAccount = this.now();"
+  },
+  {
+    "name": "pause ignored by the schedule",
+    "file": "src/app.js",
+    "from": "if (this.pause) due = Math.max(due, this.pause.due);",
+    "to": ""
+  },
+  {
+    "name": "refusal ignored by the schedule",
+    "file": "src/app.js",
+    "from": "if (!this.session || this.isRefused()) {",
+    "to": "if (!this.session) {"
+  },
+  {
+    "name": "refusal kept after new credentials",
+    "file": "src/app.js",
+    "from": "if (credsChanged && this.refused) {",
+    "to": "if (false) {"
+  },
+  {
+    "name": "unreadable /data: read at once",
+    "file": "src/app.js",
+    "from": "if (this.storeState !== 'ok') return mono + interval;",
+    "to": ""
+  },
+  {
+    "name": "unreadable /data written over",
+    "file": "src/app.js",
+    "from": "    if (this.storeState !== 'ok') return false;",
+    "to": ""
+  },
+  {
+    "name": "stale prices published",
+    "file": "src/app.js",
+    "from": "      this.monotonic() - this.accountOkMono > PRICES_MAX_AGE",
+    "to": "      false"
+  },
+  {
+    "name": "unknown price priced as 0",
+    "file": "src/app.js",
+    "from": "!Number.isFinite(t0) || p1 === undefined || p2 === undefined || !finite(kwh) || kwh < 0",
+    "to": "!Number.isFinite(t0) || !finite(kwh) || kwh < 0"
+  },
+  {
+    "name": "negative cost",
+    "file": "src/app.js",
+    "from": "const cost = Math.max(0, (kwh * (p1 + p2)) / 2);",
+    "to": "const cost = (kwh * (p1 + p2)) / 2;"
+  },
+  {
+    "name": "test button not limited",
+    "file": "src/app.js",
+    "from": "mono - this.lastTest < TEST_MIN_GAP",
+    "to": "false"
+  },
+  {
+    "name": "test button ignores the pause",
+    "file": "src/app.js",
+    "from": "if (this.pauseActive(mono)) return both('testPaused', { time: clock(this.pause.until) });",
+    "to": ""
+  },
+  {
+    "name": "config changes read at once",
+    "file": "src/app.js",
+    "from": "    const wait = this.freshConfig\n      ? CREATED_MIN_GAP",
+    "to": "    const wait = this.freshConfig\n      ? 0"
+  },
+  {
+    "name": "ambiguous MaLo suffix guessed",
+    "file": "src/app.js",
+    "from": "return matches.length === 1 ? matches[0] : undefined;",
+    "to": "return matches[0];"
+  },
+  {
+    "name": "pause de Retry-After non plafonnée à 6 h",
+    "file": "src/app.js",
+    "from": "const ms = Math.min(PAUSE_MAX, Math.max(asked, base * 2 ** (count - 1)));",
+    "to": "const ms = Math.max(asked, base * 2 ** (count - 1));"
+  },
+  {
+    "name": "pause relue de /data non plafonnée",
+    "file": "src/app.js",
+    "from": "const left = Math.min(Math.max(0, pause.until - now), PAUSE_MAX);",
+    "to": "const left = Math.max(0, pause.until - now);"
+  },
+  {
+    "name": "rattrapage 7 jours marqué fait malgré un échec",
+    "file": "src/app.js",
+    "from": "if (full && !problem) this.data.lastFull = today;",
+    "to": "if (full) this.data.lastFull = today;"
+  },
+  {
+    "name": "KT-CT-11334 plus un refus",
+    "file": "src/kraken/client.js",
+    "from": "if (primary && err.kt && (REFUSED.has(err.kt) || err.kt === API_ACCESS)) {",
+    "to": "if (primary && err.kt && REFUSED.has(err.kt)) {"
+  },
+  {
+    "name": "empreinte du refus sans le mot de passe",
+    "file": "src/app.js",
+    "from": "\\u0000${credentials.password ?? ''}`",
+    "to": "`"
+  },
+  {
+    "name": "getConfig en échec après stop() réarme",
+    "file": "src/app.js",
+    "from": "    } catch (err) {\n      if (this.stopped || epoch !== this.stopEpoch) return;",
+    "to": "    } catch (err) {"
+  },
+  {
+    "name": "kept past price rewritten",
+    "file": "src/app.js",
+    "from": "if (q <= now && kept[index] !== undefined) continue;",
+    "to": ""
+  },
+  {
+    "name": "MaLos seen replaced, not merged",
+    "file": "src/app.js",
+    "from": "const meters = [...seen, ...this.data.meters.filter((x) => !seen.some((m) => m.key === x.key))]",
+    "to": "const meters = [...seen]"
+  },
+  {
+    "name": "empty suffix takes the first of several",
+    "file": "src/app.js",
+    "from": "if (!raw) return known.length === 1 ? known[0] : undefined;",
+    "to": "if (!raw) return known[0];"
+  },
+  {
+    "name": "e-mail login gone not detected",
+    "file": "src/kraken/client.js",
+    "from": "if (primary && !input.APIKey && (err.kt === DISABLED || err.schema)) {",
+    "to": "if (false) {"
+  },
+  {
+    "name": "account number lifts a refusal",
+    "file": "src/app.js",
+    "from": "this.credKey !== undefined && JSON.stringify(credentials) !== this.credOnly;",
+    "to": "this.credKey !== undefined && credKey !== this.credKey;"
+  },
+  {
+    "name": "id key not required before reading",
+    "file": "src/app.js",
+    "from": "    if (!(await this.ensureIdKey(gen))) {\n      this.failures += 1;",
+    "to": "    if (false) {\n      this.failures += 1;"
+  },
+  {
+    "name": "r2 prix gardé d'un quart commencé réécrit",
+    "file": "src/app.js",
+    "from": "        if (q <= now && kept[index] !== undefined) continue;\n",
+    "to": ""
+  },
+  {
+    "name": "r2 MaLo vues remplacées (plus fusionnées)",
+    "file": "src/app.js",
+    "from": "const meters = [...seen, ...this.data.meters.filter((x) => !seen.some((m) => m.key === x.key))]",
+    "to": "const meters = [...seen]"
+  },
+  {
+    "name": "r2 lecture sans clé d'id",
+    "file": "src/app.js",
+    "from": "    if (!(await this.ensureIdKey(gen))) {",
+    "to": "    if (false) {"
+  },
+  {
+    "name": "r2 suffixe vide avec plusieurs MaLo",
+    "file": "src/app.js",
+    "from": "if (!raw) return known.length === 1 ? known[0] : undefined;",
+    "to": "if (!raw) return known[0];"
+  },
+  {
+    "name": "r2 connexion e-mail retirée non reconnue",
+    "file": "src/kraken/client.js",
+    "from": "if (primary && !input.APIKey && (err.kt === DISABLED || err.schema)) {",
+    "to": "if (false) {"
+  },
+  {
+    "name": "r2 pause de connexion non levée par de nouveaux identifiants",
+    "file": "src/app.js",
+    "from": "if (credsChanged && this.pause && LOGIN_PAUSES.has(this.pause.code)) {",
+    "to": "if (false) {"
+  },
+  {
+    "name": "r2 refus levé par le seul numéro de compte",
+    "file": "src/app.js",
+    "from": "if (credsChanged && this.refused) {",
+    "to": "if (changed && this.credKey !== undefined && this.refused) {"
+  },
+  {
+    "name": "r2 HMAC sans clé",
+    "file": "src/kraken/model.js",
+    "from": "createHmac('sha256', idKey)",
+    "to": "createHmac('sha256', '')"
+  },
+  {
+    "name": "id key attempts not shared",
+    "file": "src/app.js",
+    "from": "if (this.idKeyPending) return this.idKeyPending;",
+    "to": ""
+  },
+  {
+    "name": "id key not read back",
+    "file": "src/app.js",
+    "from": "        key = stored(await this.gladys.getConfig());\n        if (!key) throw new Error('not stored');",
+    "to": "        key = this.idKeyMade;\n        if (!key) throw new Error('not stored');"
+  },
+  {
+    "name": "key tag not checked",
+    "file": "src/app.js",
+    "from": "if (this.data.keyTag && this.data.keyTag !== tag) {",
+    "to": "if (false) {"
+  },
+  {
+    "name": "discovery only on MaLo change",
+    "file": "src/app.js",
+    "from": "if (onlyChanged && text === this.lastDiscovery) return;",
+    "to": "if (onlyChanged && this.lastDiscovery !== undefined) return;"
+  },
+  {
+    "name": "schema error not tied to email",
+    "file": "src/kraken/client.js",
+    "from": "&& /\\b(email|password)\\b/i.test(text)",
+    "to": ""
+  },
+  {
+    "name": "key attempt not noted before",
+    "file": "src/app.js",
+    "from": "    if (!(await this.ensureIdKey(gen))) {\n      this.failures += 1;\n      throw new KrakenError('gladys_config');",
+    "to": "    if (!(await this.ensureIdKey(gen))) {\n      this.lastAccountMono = undefined;\n      throw new KrakenError('gladys_config');"
+  },
+  {
+    "name": "id key tried without backoff",
+    "file": "src/app.js",
+    "from": "    if (this.idKeyDue !== undefined && this.monotonic() < this.idKeyDue)\n      return Promise.resolve(false);\n",
+    "to": ""
+  },
+  {
+    "name": "answer with errors outside a MaLo taken (r2 reviewer, adapted)",
+    "file": "src/app.js",
+    "from": "if (parts?.whole) throw new KrakenError('partial', { kt: ktOf(errors) });",
+    "to": ""
+  },
+  {
+    "name": "key status announces the key spacing, not the next read",
+    "file": "src/app.js",
+    "from": ", (this.dueMono ?? mono) - mono);",
+    "to": ");"
+  },
+  {
+    "name": "punta hours shifted",
+    "file": "src/tariff.js",
+    "from": "[3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 1, 1, 1, 1, 2, 2, 2, 2, 1, 1, 1, 1, 2, 2],",
+    "to": "[3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 2, 2],"
+  },
+  {
+    "name": "Ceuta hours as the peninsula",
+    "file": "src/tariff.js",
+    "from": "[3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 1, 1, 1, 1, 2, 2, 2, 2, 1, 1, 1, 1, 2],",
+    "to": "[3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 1, 1, 1, 1, 2, 2, 2, 2, 1, 1, 1, 1, 2, 2],"
+  },
+  {
+    "name": "Canary Islands in Madrid time",
+    "file": "src/tariff.js",
+    "from": "[ZONES.CANARIAS]: 'Atlantic/Canary',",
+    "to": "[ZONES.CANARIAS]: 'Europe/Madrid',"
+  },
+  {
+    "name": "weekend not valle",
+    "file": "src/tariff.js",
+    "from": "if (weekday === 'Sat' || weekday === 'Sun' || NATIONAL_HOLIDAYS.includes(md)) return P3;",
+    "to": "if (NATIONAL_HOLIDAYS.includes(md)) return P3;"
+  },
+  {
+    "name": "holidays not valle",
+    "file": "src/tariff.js",
+    "from": "if (weekday === 'Sat' || weekday === 'Sun' || NATIONAL_HOLIDAYS.includes(md)) return P3;",
+    "to": "if (weekday === 'Sat' || weekday === 'Sun') return P3;"
+  },
+  {
+    "name": "prices without taxes taken",
+    "file": "src/kraken/model.js",
+    "from": "prices: threePrices(prices?.variableTermWithTaxes),",
+    "to": "prices: threePrices(prices?.variableTermWithTaxes) ?? threePrices(prices?.variableTerm),"
+  },
+  {
+    "name": "an unreadable price taken as 0",
+    "file": "src/kraken/model.js",
+    "from": "return out.every((p) => p !== undefined) ? out : undefined;",
+    "to": "return out.map((p) => p ?? 0);"
+  },
+  {
+    "name": "a missing ledger taken as 0",
+    "file": "src/kraken/model.js",
+    "from": "return hits.length === 1 ? eurOfCents(hits[0].balance) : undefined;",
+    "to": "return hits.length ? eurOfCents(hits[0].balance) : 0;"
+  },
+  {
+    "name": "a bill without amount taken",
+    "file": "src/kraken/model.js",
+    "from": "if (issued !== undefined && amount !== undefined && amount >= 0) {",
+    "to": "if (issued !== undefined) {"
+  },
+  {
+    "name": "readings of several supply points taken",
+    "file": "src/kraken/model.js",
+    "from": "  if (edges.length > 1) {\n    into.several = true;\n    return into;\n  }\n",
+    "to": ""
+  },
+  {
+    "name": "a non-hour interval taken",
+    "file": "src/kraken/model.js",
+    "from": "if (start === undefined || end === undefined || end - start !== HOUR || start % HOUR) continue;",
+    "to": "if (start === undefined || end === undefined) continue;"
+  },
+  {
+    "name": "another unit taken as kWh",
+    "file": "src/kraken/model.js",
+    "from": "if (n.units !== undefined && n.units !== null && n.units !== 'KILOWATT_HOURS') continue;",
+    "to": ""
+  },
+  {
+    "name": "conflicting hours kept",
+    "file": "src/kraken/model.js",
+    "from": "for (const c of into.conflicts) into.hours.delete(c);",
+    "to": ""
+  },
+  {
+    "name": "hour not halved",
+    "file": "src/kraken/model.js",
+    "from": "const half = Math.round((hours.get(t) / 2) * 1e6) / 1e6;",
+    "to": "const half = hours.get(t);"
+  },
+  {
+    "name": "unfinished hour published",
+    "file": "src/kraken/model.js",
+    "from": "if (t + HOUR > now) continue;",
+    "to": ""
+  },
+  {
+    "name": "prices recorded a day ahead",
+    "file": "src/app.js",
+    "from": "for (let q = now - (now % QUARTER); q < now + PRICE_AHEAD; q += QUARTER) {",
+    "to": "for (let q = now - (now % QUARTER); q < now + DAY; q += QUARTER) {"
+  },
+  {
+    "name": "past priced from today's prices",
+    "file": "src/app.js",
+    "from": "if (point?.prices && q >= now - (now % QUARTER) && q < now + 2 * DAY) {",
+    "to": "if (point?.prices) {"
+  },
+  {
+    "name": "consumption read with several supply points",
+    "file": "src/app.js",
+    "from": "    if (this.points.length !== 1) return [];\n",
+    "to": ""
+  },
+  {
+    "name": "a 429 of the billing swallowed",
+    "file": "src/app.js",
+    "from": "      if (PAUSING.has(err?.code) || err?.code === 'stopped') throw err;\n      this.billingError",
+    "to": "      this.billingError"
+  },
+  {
+    "name": "stale balances published",
+    "file": "src/app.js",
+    "from": "if (this.data.accountKey && held && this.monotonic() - held.at <= PRICES_MAX_AGE) {",
+    "to": "if (this.data.accountKey && held) {"
+  },
+  {
+    "name": "label on a flat product",
+    "file": "src/app.js",
+    "from": "if (!point?.prices || isFlat(point.prices)) return undefined;",
+    "to": "if (!point?.prices) return undefined;"
+  },
+  {
+    "name": "unknown zone taken as the peninsula",
+    "file": "src/config.js",
+    "from": "if (!config.problem && zoneGiven && !Object.values(ZONES).includes(raw.zone)) {",
+    "to": "if (false) {"
+  }
+]

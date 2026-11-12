@@ -1,0 +1,1369 @@
+// -----------------------------------------------------------------------------
+// The integration itself: the Octopus Energy España account read through the
+// Kraken GraphQL API, one Gladys device per electricity supply point (CUPS)
+// and one for the account (balances, last bill), the hourly consumption
+// published after the fact (publishEnergyConsumption), the prices kept to
+// price the delegated contracts, the pauses and the refused login kept in
+// /data, the test button. index.js only wires the SDK handlers to it.
+// Read-only: the only mutation ever sent is the login.
+//
+// Pace (each kept in /data before the request, so a restart never reads
+// sooner): the account (supply points, prices, balances, last bill) every
+// hour; the consumption of the CREATED supply point every 6 hours (4 days; 14
+// days once a day after 06:00 in Spain and for a new device). A failed read is
+// tried again after 5, 10, 20, 40 then every 60 minutes; a 429, a 5xx or a
+// blocked login pause every request (persisted, at most 6 hours). The price
+// features are published again at every quarter of an hour from what is held:
+// no request.
+//
+// Prices: the API gives the prices of the contract in force for the three
+// 2.0TD periods, never their dates. The price of an instant is the price of
+// its period (tariff.js, in the zone of the form) under the prices read last;
+// the quarters from now to PRICE_AHEAD are kept in /data at every read, and
+// the past is priced from what was kept only (never from today's prices).
+//
+// Two clocks: `now` (wall clock) dates the prices, the consumption and what
+// /data keeps; `monotonic` paces the reads, the pauses and the token, so that
+// a wall clock set back or forward never stops nor hurries them.
+//
+// A start (config saved, reconnection) opens a new generation: a late answer
+// of an older one publishes nothing and sets no status (checked after every
+// await).
+// -----------------------------------------------------------------------------
+
+import { createHash, randomBytes } from 'node:crypto';
+import { credentialsOf, normalizeConfig } from './config.js';
+import {
+  ACCOUNT_INTERVAL,
+  BACKFILL_DAYS,
+  BACKFILL_HOUR,
+  CONFIG_RETRY_MAX,
+  CONFIG_RETRY_MIN,
+  CONSUMPTION_DAYS,
+  CONSUMPTION_INTERVAL,
+  CREATED_MIN_GAP,
+  DAY,
+  HOUR,
+  LOGIN_BLOCK_PAUSE,
+  MAX_ACCOUNTS,
+  MAX_PAGES,
+  MAX_STATUS,
+  PAGE_SIZE,
+  PAUSE_MAX,
+  PRICE_AHEAD,
+  PRICE_HISTORY_DAYS,
+  PRICES_MAX_AGE,
+  QUARTER,
+  RATE_LIMIT_PAUSE,
+  RETRY_MAX,
+  RETRY_MIN,
+  SERVER_PAUSE,
+  STORE_RETRY,
+  STORE_WAIT,
+  TEST_MIN_GAP,
+  TICK,
+} from './constants.js';
+import {
+  FEATURE,
+  KIND,
+  buildAccountDevice,
+  buildCupsDevice,
+  idsOf,
+  parseDeviceId,
+  statesOf,
+} from './devices.js';
+import { both, t } from './i18n.js';
+import { KrakenError, KrakenSession, ktOf } from './kraken/client.js';
+import {
+  brokenParts,
+  halfHours,
+  keyOf,
+  parseAccount,
+  parseAccounts,
+  parseBilling,
+  parseReadings,
+} from './kraken/model.js';
+import { ACCOUNT, ACCOUNTS, BILLING, READINGS } from './kraken/queries.js';
+import { FileStore } from './store.js';
+import { isFlat, periodAt, periodPrice } from './tariff.js';
+import { addDays, clock, localDate, madrid } from './time.js';
+
+const TIMED_OUT = Symbol('timed out');
+const finite = (v) => typeof v === 'number' && Number.isFinite(v);
+const KEY = /^[0-9a-f]{16}$/;
+/** Errors that pause every request. */
+const PAUSING = new Set(['rate_limited', 'server', 'login_blocked', 'login_gone']);
+/** Pauses that belong to the login: lifted when the credentials change. */
+const LOGIN_PAUSES = new Set(['login_blocked', 'login_gone']);
+const ID_KEY = /^[0-9a-f]{64}$/;
+/** At most this many supply points (and their prices) kept in /data, the least recently seen out. */
+const MAX_KEPT_METERS = 8;
+
+/** 8 bits of a salted hash of the credentials: nothing to find them back from. */
+export const tagOf = (salt, credentials) =>
+  createHash('sha256')
+    .update(
+      `${salt}\u0000${credentials.apiKey ?? ''}\u0000${credentials.email ?? ''}\u0000${credentials.password ?? ''}`,
+      'utf8',
+    )
+    .digest()[0];
+
+/** A pause read back from /data, its rest capped to PAUSE_MAX; undefined when invalid. */
+export function validPause(pause, now, mono) {
+  if (
+    !pause ||
+    !finite(pause.until) ||
+    !Number.isInteger(pause.count) ||
+    pause.count < 1 ||
+    !PAUSING.has(pause.code)
+  ) {
+    return undefined;
+  }
+  const left = Math.min(Math.max(0, pause.until - now), PAUSE_MAX);
+  return {
+    until: now + left,
+    due: mono + left,
+    count: Math.min(pause.count, 16),
+    code: pause.code,
+    detail: typeof pause.detail === 'string' ? pause.detail.slice(0, 24) : null,
+  };
+}
+
+export function validRefused(refused) {
+  return refused &&
+    typeof refused.salt === 'string' &&
+    /^[0-9a-f]{32}$/.test(refused.salt) &&
+    Number.isInteger(refused.tag) &&
+    refused.tag >= 0 &&
+    refused.tag < 256
+    ? {
+        salt: refused.salt,
+        tag: refused.tag,
+        code: refused.code === 'api_access' ? 'api_access' : 'refused',
+        kt:
+          typeof refused.kt === 'string' && /^KT-CT-\d{4,5}$/.test(refused.kt) ? refused.kt : null,
+      }
+    : undefined;
+}
+
+function validMeters(meters) {
+  const out = [];
+  for (const m of Array.isArray(meters) ? meters.slice(0, 8) : []) {
+    if (!KEY.test(m?.key ?? '') || typeof m.suffix !== 'string' || !/^[A-Z0-9]{4}$/.test(m.suffix))
+      continue;
+    out.push({ key: m.key, suffix: m.suffix, seen: finite(m.seen) ? m.seen : 0 });
+  }
+  return out;
+}
+
+/** The prices kept: { cupsKey: { quarterIndex: EUR/kWh } }, bounded. */
+function validPrices(prices, now) {
+  const out = {};
+  if (!prices || typeof prices !== 'object' || Array.isArray(prices)) return out;
+  const oldest = Math.floor((now - PRICE_HISTORY_DAYS * DAY) / QUARTER);
+  for (const [key, slots] of Object.entries(prices).slice(0, 8)) {
+    if (!KEY.test(key) || !slots || typeof slots !== 'object') continue;
+    const kept = {};
+    for (const [index, price] of Object.entries(slots).slice(0, 6000)) {
+      const i = Number(index);
+      if (Number.isInteger(i) && i >= oldest && finite(price) && Math.abs(price) <= 10)
+        kept[i] = price;
+    }
+    out[key] = kept;
+  }
+  return out;
+}
+
+const bound = (text, max) => (text.length > max ? `${text.slice(0, max - 1)}…` : text);
+const codeOf = (err) => (err instanceof KrakenError ? (err.kt ?? err.code) : 'bad_response');
+
+export class OctopusApp {
+  constructor({
+    gladys,
+    logger = console,
+    now = () => Date.now(),
+    monotonic = () => performance.now(),
+    timers = { setTimeout, clearTimeout },
+    store = new FileStore(),
+    fetchImpl = (...args) => globalThis.fetch(...args),
+    random = (n) => randomBytes(n),
+    requestGap,
+    requestTimeout,
+    apiUrl,
+  }) {
+    this.gladys = gladys;
+    this.log = logger;
+    this.now = now;
+    this.monotonic = monotonic;
+    this.timers = timers;
+    this.store = store;
+    this.fetchImpl = fetchImpl;
+    this.random = random;
+    this.requestGap = requestGap;
+    this.requestTimeout = requestTimeout;
+    this.apiUrl = apiUrl;
+
+    this.gen = 0;
+    this.stopped = false;
+    this.stopEpoch = 0;
+    this.config = normalizeConfig({});
+    this.session = undefined;
+    this.credKey = undefined;
+
+    /** What /data keeps. */
+    this.data = {
+      lastAccount: null,
+      lastConsumption: null,
+      lastFull: null,
+      pause: null,
+      refused: null,
+      meters: [],
+      backfilled: [],
+      prices: {},
+      accountKey: null,
+      keyTag: null,
+    };
+    this.storeState = 'pending';
+    this.loading = null;
+    this.storeTimer = null;
+    this.pause = undefined;
+    this.refused = undefined;
+
+    /** The account read in this process (with the full CUPS, memory only). */
+    this.account = undefined;
+    this.points = [];
+    this.billing = undefined;
+    this.billingError = undefined;
+    this.created = new Set();
+    this.accountsFound = 0;
+    this.accountProblem = undefined;
+
+    this.lastAccountMono = undefined;
+    this.lastConsumptionMono = undefined;
+    this.accountOkAt = undefined;
+    this.accountOkMono = undefined;
+    this.failures = 0;
+    this.lastError = undefined;
+    this.consumptionError = undefined;
+    this.pendingBackfill = new Set();
+
+    this.roundTimer = null;
+    this.tickTimer = null;
+    this.configTimer = null;
+    this.configDelay = 0;
+    this.running = Promise.resolve();
+    this.sleeps = new Set();
+    this.lastStatus = undefined;
+    this.lastTest = undefined;
+    this.dueMono = undefined;
+    this.lastDiscovery = undefined;
+    this.idKeyPending = undefined;
+    this.idKeyDue = undefined;
+    this.idKeyFailures = 0;
+    this.freshConfig = false;
+  }
+
+  gone(gen) {
+    return this.stopped || gen !== this.gen;
+  }
+
+  // --- Lifecycle -------------------------------------------------------------------
+
+  /** Every (re)connection to Gladys: read the config (retried for ever), then start. */
+  async connected() {
+    const epoch = this.stopEpoch;
+    this.stopped = false;
+    this.lastStatus = undefined;
+    // What Gladys holds may be older than this process knows: published again.
+    this.gladys.forgetPublishedStates?.();
+    if (this.configTimer) {
+      this.timers.clearTimeout(this.configTimer);
+      this.configTimer = null;
+    }
+    let config;
+    try {
+      config = await this.gladys.getConfig();
+    } catch (err) {
+      if (this.stopped || epoch !== this.stopEpoch) return;
+      this.configDelay = Math.min(
+        CONFIG_RETRY_MAX,
+        Math.max(CONFIG_RETRY_MIN, this.configDelay * 2),
+      );
+      this.log.warn(
+        `Configuration not read (${err?.name ?? 'Error'}): again in ${this.configDelay / 1000} s`,
+      );
+      await this.setStatus(false, both('configUnread'));
+      this.configTimer = this.timers.setTimeout(() => {
+        this.configTimer = null;
+        this.connected().catch((e) => this.log.error(`Start failed (${e?.name ?? 'Error'})`));
+      }, this.configDelay);
+      return;
+    }
+    if (this.stopped || epoch !== this.stopEpoch) return;
+    this.configDelay = 0;
+    await this.start(config);
+  }
+
+  async start(rawConfig) {
+    this.stopped = false;
+    const gen = ++this.gen;
+    const config = normalizeConfig(rawConfig);
+    const credentials = credentialsOf(config);
+    const credKey = JSON.stringify([credentials, config.accountNumber]);
+    const changed = credKey !== this.credKey;
+    const credsChanged =
+      this.credKey !== undefined && JSON.stringify(credentials) !== this.credOnly;
+    this.credOnly = JSON.stringify(credentials);
+    // Another login or account entered by the user: read soon (not at a restart).
+    if (changed && this.credKey !== undefined) this.freshConfig = true;
+    // Credentials changed in this process: always tried, even when their
+    // 8-bit tag matches the refused one (a restart keeps the tag only). The
+    // account number alone never lifts a refusal.
+    if (credsChanged && this.refused) {
+      this.refused = undefined;
+      this.data.refused = null;
+    }
+    // A pause of the login (blocked, e-mail login gone) ends with new credentials.
+    if (credsChanged && this.pause && LOGIN_PAUSES.has(this.pause.code)) {
+      this.pause = undefined;
+      this.data.pause = null;
+    }
+    this.takeIdKey(rawConfig);
+    this.config = config;
+    if (changed || !this.session) {
+      this.session?.close();
+      this.session = config.problem
+        ? undefined
+        : new KrakenSession({
+            credentials,
+            fetchImpl: this.fetchImpl,
+            monotonic: this.monotonic,
+            sleep: (ms) => this.sleep(ms),
+            ...(this.apiUrl ? { url: this.apiUrl } : {}),
+            ...(this.requestTimeout ? { timeout: this.requestTimeout } : {}),
+            ...(this.requestGap !== undefined ? { gap: this.requestGap } : {}),
+          });
+      this.credKey = credKey;
+      if (changed) {
+        // Another login: what was read belongs to the old one.
+        this.account = undefined;
+        this.points = [];
+        this.billing = undefined;
+        this.billingError = undefined;
+        this.failures = 0;
+        this.lastError = undefined;
+        this.accountProblem = undefined;
+        this.accountsFound = 0;
+      }
+    }
+    this.clearRound();
+    await this.ready();
+    if (this.gone(gen)) return;
+    await this.ensureIdKey(gen);
+    if (this.gone(gen)) return;
+    await this.refreshCreated(gen);
+    if (this.gone(gen)) return;
+    await this.publishDiscovery(gen);
+    if (this.gone(gen)) return;
+    this.schedule(gen);
+    this.armTick(gen);
+    await this.publishPrices(gen);
+    await this.report(gen);
+  }
+
+  /** The id key stored in the Gladys config (outside the form), when valid. */
+  takeIdKey(rawConfig) {
+    const key = typeof rawConfig?.id_key === 'string' ? rawConfig.id_key : '';
+    if (ID_KEY.test(key)) this.adoptIdKey(key);
+  }
+
+  /** The key stored in Gladys becomes the one in use; what depended on another one is forgotten. */
+  adoptIdKey(key) {
+    if (key === this.idKey) return;
+    if (this.idKey) {
+      // Another key: the keys of what was read change with it.
+      this.points = [];
+      this.account = undefined;
+      this.lastDiscovery = undefined;
+    }
+    this.idKey = key;
+    this.checkKeyTag();
+  }
+
+  /**
+   * /data keeps 4 bytes of an HMAC of the id key (nothing to find the key
+   * back from): when the key in use is another one, the supply points,
+   * prices, account key and backfills of /data (keyed by the old one) go.
+   */
+  checkKeyTag() {
+    if (!this.idKey || this.storeState !== 'ok') return;
+    const tag = keyOf(this.idKey, 'tag', 'octopus-spain').slice(0, 8);
+    if (this.data.keyTag && this.data.keyTag !== tag) {
+      this.data.meters = [];
+      this.data.prices = {};
+      this.data.accountKey = null;
+      this.data.backfilled = [];
+      this.lastDiscovery = undefined;
+    }
+    this.data.keyTag = tag;
+  }
+
+  /**
+   * The secret of the device keys (HMAC): read from the Gladys config, made
+   * once and stored there (never in /data, never shown in the form). Until it
+   * is stored, nothing is read nor published (the ids depend on it). One
+   * attempt at a time (shared by every caller), spaced 5 s doubled up to
+   * 5 min after a failure; the key adopted is the one Gladys holds once the
+   * write is done (read back), never the one made here when another won.
+   */
+  ensureIdKey(gen) {
+    if (this.idKey) return Promise.resolve(true);
+    if (this.idKeyPending) return this.idKeyPending;
+    if (this.idKeyDue !== undefined && this.monotonic() < this.idKeyDue)
+      return Promise.resolve(false);
+    this.idKeyPending = this.storeIdKey(gen).finally(() => {
+      this.idKeyPending = undefined;
+    });
+    return this.idKeyPending;
+  }
+
+  async storeIdKey(gen) {
+    const stored = (config) => (ID_KEY.test(config?.id_key ?? '') ? config.id_key : undefined);
+    try {
+      let key = stored(await this.gladys.getConfig());
+      if (!key) {
+        await this.gladys.setConfig({ id_key: this.random(32).toString('hex') });
+        // Read back: the key Gladys keeps is the only one used.
+        key = stored(await this.gladys.getConfig());
+        if (!key) throw new Error('not stored');
+      }
+      if (this.stopped && this.gone(gen)) return false;
+      this.idKeyFailures = 0;
+      this.idKeyDue = undefined;
+      this.adoptIdKey(key);
+      await this.save();
+      return true;
+    } catch (err) {
+      this.idKeyFailures = (this.idKeyFailures ?? 0) + 1;
+      const wait = Math.min(CONFIG_RETRY_MAX, CONFIG_RETRY_MIN * 2 ** (this.idKeyFailures - 1));
+      this.idKeyDue = this.monotonic() + wait;
+      this.log.warn(
+        `Id key not stored in Gladys (${err?.name ?? 'Error'}): again in ${wait / 1000} s`,
+      );
+      return false;
+    }
+  }
+
+  async stop() {
+    this.stopped = true;
+    this.stopEpoch += 1;
+    this.gen += 1;
+    this.clearRound();
+    for (const timer of [this.tickTimer, this.configTimer, this.storeTimer]) {
+      if (timer) this.timers.clearTimeout(timer);
+    }
+    this.tickTimer = null;
+    this.configTimer = null;
+    this.storeTimer = null;
+    this.session?.close();
+    this.session = undefined;
+    this.credKey = undefined;
+    for (const wake of this.sleeps) wake();
+    this.sleeps.clear();
+    await this.running.catch(() => {});
+    await this.save();
+    await this.bounded(Promise.resolve(this.store.flush?.()), STORE_WAIT).catch(() => {});
+  }
+
+  /** `promise`, or TIMED_OUT after `ms` (the timer is cleared either way). */
+  bounded(promise, ms) {
+    return new Promise((resolve, reject) => {
+      const timer = this.timers.setTimeout(() => resolve(TIMED_OUT), ms);
+      promise.then(
+        (value) => {
+          this.timers.clearTimeout(timer);
+          resolve(value);
+        },
+        (err) => {
+          this.timers.clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
+  }
+
+  /** Resolves after `ms` (injected timers), or at once when the app stops. */
+  sleep(ms) {
+    if (this.stopped) return Promise.resolve();
+    return new Promise((resolve) => {
+      let timer;
+      const wake = () => {
+        this.timers.clearTimeout(timer);
+        this.sleeps.delete(wake);
+        resolve();
+      };
+      timer = this.timers.setTimeout(wake, Math.max(0, ms));
+      this.sleeps.add(wake);
+    });
+  }
+
+  // --- /data ----------------------------------------------------------------------
+
+  /** Waits for /data at most STORE_WAIT; without it, nothing is ever saved. */
+  async ready() {
+    if (this.storeState === 'ok') return;
+    const result = await this.bounded(this.loadStore(), STORE_WAIT);
+    if (result === TIMED_OUT && this.storeState === 'pending') this.storeState = 'unreadable';
+  }
+
+  /** One read of /data at a time; an unreadable one is read again every STORE_RETRY. */
+  loadStore() {
+    if (this.loading) return this.loading;
+    this.loading = (async () => {
+      try {
+        const raw = await this.store.load();
+        const late = this.storeState === 'unreadable';
+        this.merge(raw);
+        this.storeState = 'ok';
+        // What /data keeps under another id key goes.
+        this.checkKeyTag();
+        if (late) await this.afterLateLoad();
+      } catch (err) {
+        this.storeState = 'unreadable';
+        this.log.warn(
+          `/data unreadable (${err?.name ?? 'Error'}): read again in ${STORE_RETRY / 1000} s`,
+        );
+      } finally {
+        this.loading = null;
+      }
+      if (this.storeState !== 'ok' && !this.stopped && !this.storeTimer) {
+        this.storeTimer = this.timers.setTimeout(() => {
+          this.storeTimer = null;
+          this.loadStore();
+        }, STORE_RETRY);
+      }
+    })();
+    return this.loading;
+  }
+
+  async afterLateLoad() {
+    if (this.storeState !== 'ok' || this.stopped) return;
+    const gen = this.gen;
+    await this.save();
+    if (this.gone(gen)) return;
+    if (this.roundTimer) this.schedule(gen);
+    await this.report(gen);
+  }
+
+  /** /data read back, merged with what this process learnt meanwhile (the stricter wins). */
+  merge(raw) {
+    const data = raw && typeof raw === 'object' ? raw : {};
+    const now = this.now();
+    const mono = this.monotonic();
+    for (const key of ['lastAccount', 'lastConsumption']) {
+      // A time of /data in the future is invalid: ignored.
+      if (
+        finite(data[key]) &&
+        data[key] <= now &&
+        !(finite(this.data[key]) && this.data[key] > data[key])
+      ) {
+        this.data[key] = data[key];
+      }
+    }
+    if (
+      typeof data.lastFull === 'string' &&
+      /^\d{4}-\d{2}-\d{2}$/.test(data.lastFull) &&
+      !this.data.lastFull
+    ) {
+      this.data.lastFull = data.lastFull;
+    }
+    const pause = validPause(data.pause, now, mono);
+    if (pause && !(this.pause && this.pause.until >= pause.until)) {
+      this.pause = pause;
+      this.data.pause = {
+        until: pause.until,
+        count: pause.count,
+        code: pause.code,
+        detail: pause.detail,
+      };
+    }
+    const refused = validRefused(data.refused);
+    if (refused && !this.refused) {
+      this.refused = refused;
+      this.data.refused = refused;
+    }
+    if (!this.data.meters.length) this.data.meters = validMeters(data.meters);
+    const backfilled = Array.isArray(data.backfilled)
+      ? data.backfilled.filter((k) => KEY.test(k)).slice(0, 16)
+      : [];
+    this.data.backfilled = [...new Set([...this.data.backfilled, ...backfilled])];
+    if (typeof data.keyTag === 'string' && /^[0-9a-f]{8}$/.test(data.keyTag) && !this.data.keyTag) {
+      this.data.keyTag = data.keyTag;
+    }
+    if (typeof data.accountKey === 'string' && KEY.test(data.accountKey) && !this.data.accountKey) {
+      this.data.accountKey = data.accountKey;
+    }
+    const kept = validPrices(data.prices, now);
+    for (const [key, slots] of Object.entries(kept)) {
+      this.data.prices[key] = { ...slots, ...(this.data.prices[key] ?? {}) };
+    }
+  }
+
+  async save() {
+    if (this.storeState !== 'ok') return false;
+    const snapshot = {
+      version: 1,
+      lastAccount: this.data.lastAccount,
+      lastConsumption: this.data.lastConsumption,
+      lastFull: this.data.lastFull,
+      pause: this.data.pause,
+      refused: this.data.refused,
+      meters: this.data.meters,
+      backfilled: this.data.backfilled,
+      prices: this.data.prices,
+      accountKey: this.data.accountKey,
+      keyTag: this.data.keyTag,
+    };
+    try {
+      // A slow volume never holds a read: the write goes on in the background.
+      const done = this.store.save(snapshot);
+      done.catch((err) => this.log.warn(`/data not saved (${err?.name ?? 'Error'})`));
+      return (
+        (await this.bounded(
+          done.then(() => true),
+          STORE_WAIT,
+        )) === true
+      );
+    } catch (err) {
+      this.log.warn(`/data not saved (${err?.name ?? 'Error'})`);
+      return false;
+    }
+  }
+
+  // --- Pace ------------------------------------------------------------------------
+
+  clearRound() {
+    if (this.roundTimer) {
+      this.timers.clearTimeout(this.roundTimer);
+      this.roundTimer = null;
+    }
+  }
+
+  pauseActive(mono = this.monotonic()) {
+    return Boolean(this.pause && this.pause.due > mono);
+  }
+
+  isRefused() {
+    return Boolean(
+      this.refused && this.refused.tag === tagOf(this.refused.salt, credentialsOf(this.config)),
+    );
+  }
+
+  /** The monotonic time a kind of read is due, from this process or from /data. */
+  dueOf(lastMono, lastWall, interval, mono, now) {
+    if (lastMono !== undefined) return lastMono + interval;
+    // /data not read: its last read is unknown, a whole interval is waited.
+    if (this.storeState !== 'ok') return mono + interval;
+    return finite(lastWall) && lastWall <= now
+      ? mono + Math.max(0, interval - (now - lastWall))
+      : mono;
+  }
+
+  accountDue(mono, now) {
+    const wait = this.freshConfig
+      ? CREATED_MIN_GAP
+      : this.failures > 0
+        ? Math.min(RETRY_MAX, RETRY_MIN * 2 ** (this.failures - 1))
+        : ACCOUNT_INTERVAL;
+    return this.dueOf(this.lastAccountMono, this.data.lastAccount, wait, mono, now);
+  }
+
+  consumptionDue(mono, now) {
+    if (!this.consumptionTargets().length) return Infinity;
+    const due = this.dueOf(
+      this.lastConsumptionMono,
+      this.data.lastConsumption,
+      CONSUMPTION_INTERVAL,
+      mono,
+      now,
+    );
+    // A new supply point device: soon, but never sooner than CREATED_MIN_GAP after a read.
+    if (this.consumptionTargets().some((m) => this.pendingBackfill.has(m.key))) {
+      return Math.min(
+        due,
+        this.dueOf(this.lastConsumptionMono, this.data.lastConsumption, CREATED_MIN_GAP, mono, now),
+      );
+    }
+    return due;
+  }
+
+  /** The next round: when the first kind of read is due, never during a pause or a refusal. */
+  schedule(gen) {
+    if (this.gone(gen)) return;
+    this.clearRound();
+    if (!this.session || this.isRefused()) {
+      this.dueMono = undefined;
+      return;
+    }
+    const mono = this.monotonic();
+    const now = this.now();
+    let due = this.accountDue(mono, now);
+    // The consumption needs an account read in this process.
+    if (this.account) due = Math.min(due, this.consumptionDue(mono, now));
+    if (this.pause) due = Math.max(due, this.pause.due);
+    this.dueMono = Math.max(due, mono);
+    this.roundTimer = this.timers.setTimeout(() => {
+      this.roundTimer = null;
+      this.running = this.round(gen).catch((err) =>
+        this.log.error(`Round failed (${err?.name ?? 'Error'})`),
+      );
+    }, this.dueMono - mono);
+  }
+
+  /** The price features again at every quarter of an hour (no request). */
+  armTick(gen) {
+    if (this.tickTimer) this.timers.clearTimeout(this.tickTimer);
+    const now = this.now();
+    // On the next quarter (wall clock: the tariff slots are), a second after it.
+    const wait = Math.min(TICK, QUARTER - (now % QUARTER) + 1000);
+    this.tickTimer = this.timers.setTimeout(() => {
+      this.tickTimer = null;
+      if (this.gone(gen)) return;
+      this.publishPrices(gen)
+        .catch(() => {})
+        .then(() => {
+          if (!this.gone(gen)) this.armTick(gen);
+        });
+    }, wait);
+  }
+
+  // --- Reads -------------------------------------------------------------------------
+
+  async round(gen) {
+    if (this.gone(gen) || !this.session || this.isRefused()) return;
+    if (this.pauseActive()) {
+      this.schedule(gen);
+      return;
+    }
+    const now = this.now();
+    const mono = this.monotonic();
+    try {
+      if (!this.account || this.accountDue(mono, now) <= mono) {
+        await this.readAccount(gen);
+      }
+      if (this.gone(gen)) return;
+      if (
+        this.account &&
+        !this.pauseActive() &&
+        this.consumptionDue(this.monotonic(), this.now()) <= this.monotonic()
+      ) {
+        await this.readConsumption(gen);
+      }
+    } catch (err) {
+      if (this.gone(gen)) return;
+      await this.failed(gen, err);
+    }
+    if (this.gone(gen)) return;
+    this.schedule(gen);
+    await this.report(gen);
+  }
+
+  /** A read failed: a refusal, a pause or a passing error (retried later). */
+  async failed(gen, err) {
+    const code = err instanceof KrakenError ? err.code : 'bad_response';
+    if (code === 'stopped') return;
+    if (code === 'refused' || code === 'api_access') {
+      await this.refuse(err);
+      return;
+    }
+    if (PAUSING.has(code)) {
+      await this.setPause(err);
+      return;
+    }
+    this.lastError = codeOf(err);
+    this.log.warn(`Octopus not read (${this.lastError})`);
+  }
+
+  async refuse(err) {
+    const salt = this.random(16).toString('hex');
+    this.refused = {
+      salt,
+      tag: tagOf(salt, credentialsOf(this.config)),
+      code: err.code === 'api_access' ? 'api_access' : 'refused',
+      kt: err.kt ?? null,
+    };
+    this.data.refused = this.refused;
+    this.log.warn(
+      `Octopus refused the login (${err.kt ?? err.code}): no request until the credentials change or Test succeeds`,
+    );
+    this.clearRound();
+    await this.save();
+  }
+
+  async setPause(err) {
+    const now = this.now();
+    const mono = this.monotonic();
+    const count = Math.min((this.pause?.code === err.code ? this.pause.count : 0) + 1, 16);
+    const base =
+      err.code === 'rate_limited'
+        ? RATE_LIMIT_PAUSE
+        : LOGIN_PAUSES.has(err.code)
+          ? LOGIN_BLOCK_PAUSE
+          : SERVER_PAUSE;
+    const asked = finite(err.retryAfter) && err.retryAfter > 0 ? err.retryAfter : 0;
+    const ms = Math.min(PAUSE_MAX, Math.max(asked, base * 2 ** (count - 1)));
+    const detail = err.kt ?? (err.status ? `HTTP ${err.status}` : null);
+    this.pause = { until: now + ms, due: mono + ms, count, code: err.code, detail };
+    this.data.pause = { until: now + ms, count, code: err.code, detail };
+    this.log.warn(`Octopus paused until ${clock(now + ms)} (${detail ?? err.code})`);
+    await this.save();
+  }
+
+  /** A request answered: the pause is over and its count forgotten. */
+  async clearPause() {
+    if (!this.pause && !this.data.pause) return;
+    this.pause = undefined;
+    this.data.pause = null;
+    await this.save();
+  }
+
+  async readAccount(gen) {
+    const session = this.session;
+    // The attempt is kept BEFORE anything: a restart, or a key not stored, never reads sooner.
+    this.freshConfig = false;
+    this.lastAccountMono = this.monotonic();
+    this.data.lastAccount = this.now();
+    await this.save();
+    if (this.gone(gen)) return;
+    if (!(await this.ensureIdKey(gen))) {
+      this.failures += 1;
+      throw new KrakenError('gladys_config');
+    }
+    if (this.gone(gen)) return;
+    let numbers;
+    try {
+      const { data } = await session.request(ACCOUNTS);
+      numbers = parseAccounts(data).slice(0, MAX_ACCOUNTS);
+    } catch (err) {
+      this.failures += 1;
+      throw err;
+    }
+    if (this.gone(gen)) return;
+    await this.clearPause();
+    this.accountsFound = numbers.length;
+    const wanted = this.config.accountNumber;
+    const number = wanted ? numbers.find((n) => n === wanted) : numbers[0];
+    if (!number) {
+      this.failures = 0;
+      this.lastError = undefined;
+      this.accountProblem = numbers.length ? 'unknownAccount' : 'noAccount';
+      return;
+    }
+    let points;
+    try {
+      const { data, errors } = await session.request(ACCOUNT, { accountNumber: number });
+      // An answer with errors is passing: what was read before is kept,
+      // nothing is guessed from it. An error pointing at one supply point
+      // only spoils that one (it keeps what was read before); an error
+      // anywhere else spoils the whole answer.
+      const parts = errors ? brokenParts(errors) : undefined;
+      if (parts?.whole) throw new KrakenError('partial', { kt: ktOf(errors) });
+      if (parts) this.log.warn(`Part of the account not read (${ktOf(errors) ?? 'error'})`);
+      points = parseAccount(data, this.idKey, parts);
+      if (!points) throw new KrakenError('bad_response');
+      points = points
+        .map((m) => (m.broken ? this.points.find((x) => x.key === m.key) : m))
+        .filter(Boolean);
+    } catch (err) {
+      this.failures += 1;
+      throw err;
+    }
+    if (this.gone(gen)) return;
+    this.failures = 0;
+    this.lastError = undefined;
+    this.accountProblem = points.length ? undefined : 'noCups';
+    this.account = { number, several: !wanted && numbers.length > 1 };
+    this.points = points;
+    this.accountOkAt = this.now();
+    this.accountOkMono = this.monotonic();
+    this.recordPrices();
+    // The account device: its key (an HMAC, nothing to find the number back from) kept in /data.
+    this.data.accountKey = keyOf(this.idKey, 'account', number);
+    // Secondary read: a failure keeps what was known, never blocks the prices.
+    try {
+      const { data } = await session.request(BILLING, { accountNumber: number });
+      this.billing = { ...parseBilling(data), at: this.monotonic() };
+      this.billingError = undefined;
+    } catch (err) {
+      if (PAUSING.has(err?.code) || err?.code === 'stopped') throw err;
+      this.billingError = codeOf(err);
+      this.log.warn(`Balances not read (${this.billingError})`);
+    }
+    if (this.gone(gen)) return;
+    // The supply points seen are merged, never replaced: a read without one
+    // keeps it (and its prices); at most MAX_KEPT_METERS, the least recently seen out.
+    const now = this.now();
+    const seen = this.points.map((m) => ({ key: m.key, suffix: m.suffix, seen: now }));
+    const meters = [...seen, ...this.data.meters.filter((x) => !seen.some((m) => m.key === x.key))]
+      .sort((a, b) => b.seen - a.seen)
+      .slice(0, MAX_KEPT_METERS);
+    this.data.meters = meters;
+    this.prunePrices();
+    await this.save();
+    if (this.gone(gen)) return;
+    // Published again when anything offered changed (a supply point, the account).
+    await this.publishDiscovery(gen, { onlyChanged: true });
+    await this.publishPrices(gen);
+  }
+
+  /**
+   * The prices of the quarters from the current one to PRICE_AHEAD, kept in
+   * /data (the API never dates its prices: never further, never the past).
+   * A quarter already started keeps the price kept for it.
+   */
+  recordPrices() {
+    const now = this.now();
+    const zone = this.config.zone;
+    for (const m of this.points) {
+      if (!m.prices) continue;
+      const kept = this.data.prices[m.key] ?? {};
+      for (let q = now - (now % QUARTER); q < now + PRICE_AHEAD; q += QUARTER) {
+        const index = Math.floor(q / QUARTER);
+        if (q <= now && kept[index] !== undefined) continue;
+        const price = periodPrice(m.prices, q, zone);
+        if (price !== undefined) kept[index] = price;
+      }
+      this.data.prices[m.key] = kept;
+    }
+    this.prunePrices();
+  }
+
+  /** Prices leave /data by their age (40 days) only, or with their supply point (beyond the 8 kept). */
+  prunePrices() {
+    const oldest = Math.floor((this.now() - PRICE_HISTORY_DAYS * DAY) / QUARTER);
+    for (const [key, kept] of Object.entries(this.data.prices)) {
+      if (!this.points.some((m) => m.key === key) && !this.data.meters.some((m) => m.key === key)) {
+        delete this.data.prices[key];
+        continue;
+      }
+      for (const index of Object.keys(kept)) if (Number(index) < oldest) delete kept[index];
+    }
+  }
+
+  /**
+   * The supply point whose consumption is read: the only one of the account,
+   * when its consumption feature is created. With several, the readings say
+   * not which one they belong to: none.
+   */
+  consumptionTargets() {
+    if (this.points.length !== 1) return [];
+    return this.points.filter((m) =>
+      this.created.has(idsOf(this.gladys, KIND.CUPS, m.key).feature(FEATURE.CONSUMPTION)),
+    );
+  }
+
+  async readConsumption(gen) {
+    const session = this.session;
+    const now = this.now();
+    this.lastConsumptionMono = this.monotonic();
+    this.data.lastConsumption = now;
+    const today = localDate(now);
+    const full = this.data.lastFull !== today && madrid(now).h >= BACKFILL_HOUR;
+    await this.save();
+    if (this.gone(gen)) return;
+    let problem;
+    for (const m of this.consumptionTargets()) {
+      const backfill = full || !this.data.backfilled.includes(m.key);
+      const days = backfill ? BACKFILL_DAYS : CONSUMPTION_DAYS;
+      const from = addDays(now, -days);
+      const to = now - (now % HOUR);
+      const into = { hours: new Map(), conflicts: new Set() };
+      let after;
+      try {
+        for (let page = 0; page < MAX_PAGES; page += 1) {
+          const { data } = await session.request(READINGS, {
+            accountNumber: this.account.number,
+            startAt: new Date(from).toISOString(),
+            endAt: new Date(to).toISOString(),
+            first: PAGE_SIZE,
+            after: after ?? null,
+          });
+          if (this.gone(gen)) return;
+          if (!parseReadings(data, into)) throw new KrakenError('bad_response');
+          if (into.several || !into.next || into.next === after) break;
+          after = into.next;
+        }
+      } catch (err) {
+        if (PAUSING.has(err?.code) || err?.code === 'stopped' || err?.code === 'refused') throw err;
+        // A reading failing never stops the prices.
+        problem = codeOf(err);
+        this.log.warn(`Consumption not read (${problem})`);
+        continue;
+      }
+      if (into.several) {
+        problem = 'several_supply_points';
+        continue;
+      }
+      const intervals = halfHours(into.hours, this.now());
+      const feature = idsOf(this.gladys, KIND.CUPS, m.key).feature(FEATURE.CONSUMPTION);
+      try {
+        for (let i = 0; i < intervals.length; i += 2000) {
+          await this.gladys.publishEnergyConsumption(feature, intervals.slice(i, i + 2000));
+          if (this.gone(gen)) return;
+        }
+        this.pendingBackfill.delete(m.key);
+        if (!this.data.backfilled.includes(m.key)) this.data.backfilled.push(m.key);
+      } catch (err) {
+        problem = 'gladys';
+        this.log.warn(`Consumption not published (${err?.name ?? 'Error'})`);
+      }
+    }
+    if (this.gone(gen)) return;
+    await this.clearPause();
+    this.consumptionError = problem;
+    if (full && !problem) this.data.lastFull = today;
+    await this.save();
+  }
+
+  // --- Gladys --------------------------------------------------------------------------
+
+  async refreshCreated(gen) {
+    try {
+      const devices = await this.bounded(Promise.resolve(this.gladys.getDevices()), 10_000);
+      if (this.gone(gen) || devices === TIMED_OUT || !Array.isArray(devices)) return;
+      this.created = new Set();
+      for (const d of devices) this.addCreated(d);
+    } catch (err) {
+      this.log.warn(`Devices not read from Gladys (${err?.name ?? 'Error'})`);
+    }
+  }
+
+  addCreated(device) {
+    if (!parseDeviceId(device?.external_id)) return;
+    this.created.add(device.external_id);
+    for (const f of device.features ?? []) if (f?.external_id) this.created.add(f.external_id);
+  }
+
+  async onDeviceCreated(device) {
+    const id = parseDeviceId(device?.external_id);
+    if (!id) return;
+    this.addCreated(device);
+    const gen = this.gen;
+    if (id.kind === KIND.CUPS && !this.data.backfilled.includes(id.key))
+      this.pendingBackfill.add(id.key);
+    // Its values from what is held, then its reads when due (never a burst).
+    await this.publishPrices(gen);
+    if (!this.gone(gen) && this.roundTimer) this.schedule(gen);
+  }
+
+  onDeviceDeleted(device) {
+    const id = parseDeviceId(device?.external_id);
+    if (!id) return;
+    for (const f of device.features ?? []) this.created.delete(f?.external_id);
+    this.created.delete(device.external_id);
+    this.pendingBackfill.delete(id.key);
+  }
+
+  /** The devices offered in Discovery: what was read, else what /data remembers. Never a request. */
+  async publishDiscovery(gen, { onlyChanged = false } = {}) {
+    const meters = this.points.length ? this.points : this.data.meters;
+    const devices = meters.map((m) => buildCupsDevice(this.gladys, m));
+    if (this.data.accountKey) {
+      devices.push(buildAccountDevice(this.gladys, { key: this.data.accountKey }));
+    }
+    const text = JSON.stringify(devices);
+    if (onlyChanged && text === this.lastDiscovery) return;
+    try {
+      await this.gladys.publishDiscoveredDevices(devices);
+      if (!this.gone(gen)) this.lastDiscovery = text;
+    } catch (err) {
+      this.log.warn(`Discovery not published (${err?.name ?? 'Error'})`);
+    }
+  }
+
+  async scan() {
+    await this.publishDiscovery(this.gen);
+  }
+
+  /** The supply point of a key, when its prices were read recently enough in this process. */
+  freshPoint(key) {
+    if (
+      this.accountOkMono === undefined ||
+      this.monotonic() - this.accountOkMono > PRICES_MAX_AGE
+    ) {
+      return undefined;
+    }
+    return this.points.find((m) => m.key === key && m.prices);
+  }
+
+  /**
+   * The price of the quarter starting at `q`: from the current quarter on,
+   * the period price under the prices read last (`point`, fresh, or null);
+   * before it, only the price kept in /data then (never today's prices).
+   */
+  priceFor(key, q, point) {
+    const now = this.now();
+    if (point?.prices && q >= now - (now % QUARTER) && q < now + 2 * DAY) {
+      return periodPrice(point.prices, q, this.config.zone);
+    }
+    return this.data.prices[key]?.[Math.floor(q / QUARTER)];
+  }
+
+  /** The label of the price at `t`: its 2.0TD period, none for a single-price product. */
+  labelFor(point, t) {
+    if (!point?.prices || isFlat(point.prices)) return undefined;
+    const p = periodAt(t, this.config.zone);
+    return p ? `P${p}` : undefined;
+  }
+
+  /** The next change of price after the quarter `q` (within 2 days): { at, price }. */
+  nextChange(key, q, price, point) {
+    for (let at = q + QUARTER; at < q + 2 * DAY; at += QUARTER) {
+      const p = this.priceFor(key, at, point);
+      if (p === undefined) return { at, price: undefined };
+      if (p !== price) return { at, price: p };
+    }
+    return undefined;
+  }
+
+  /** The features of the created devices, from what is held (no request). */
+  async publishPrices(gen) {
+    if (this.gone(gen)) return;
+    const now = this.now();
+    const q = now - (now % QUARTER);
+    const states = [];
+    for (const m of this.points) {
+      const ids = idsOf(this.gladys, KIND.CUPS, m.key);
+      const point = this.freshPoint(m.key);
+      if (!this.created.has(ids.device) || !point) continue;
+      const price = this.priceFor(m.key, q, point);
+      const next = price === undefined ? undefined : this.nextChange(m.key, q, price, point);
+      states.push(
+        ...statesOf(ids, {
+          [FEATURE.PRICE]: price,
+          // No change within 2 days: the same price; a next price unknown stays unknown.
+          [FEATURE.NEXT_PRICE]: next ? next.price : price,
+          [FEATURE.PRICE_P1]: point.prices[0],
+          [FEATURE.PRICE_P2]: point.prices[1],
+          [FEATURE.PRICE_P3]: point.prices[2],
+          [FEATURE.SURPLUS]: point.surplus,
+        }),
+      );
+    }
+    const held = this.billing;
+    if (this.data.accountKey && held && this.monotonic() - held.at <= PRICES_MAX_AGE) {
+      const ids = idsOf(this.gladys, KIND.ACCOUNT, this.data.accountKey);
+      if (this.created.has(ids.device)) {
+        states.push(
+          ...statesOf(ids, {
+            [FEATURE.CREDIT]: held.credit,
+            [FEATURE.SOLAR_WALLET]: held.wallet,
+            [FEATURE.LAST_BILL]: held.bill?.amount,
+          }),
+        );
+      }
+    }
+    if (!states.length) return;
+    try {
+      await this.gladys.publishChangedStates(states);
+    } catch (err) {
+      this.log.warn(`States not published (${err?.name ?? 'Error'})`);
+    }
+  }
+
+  // --- Energy contracts (delegated) ------------------------------------------------------
+
+  /** The supply point of a contract: the one ending with the suffix entered, else the only one. */
+  contractPoint(inputs) {
+    // Every supply point seen (this read and the ones /data keeps): one
+    // missing from a read never makes another one "the only one".
+    const known = [
+      ...this.points,
+      ...this.data.meters.filter((x) => !this.points.some((m) => m.key === x.key)),
+    ];
+    const raw = typeof inputs?.cups_suffix === 'string' ? inputs.cups_suffix.trim() : '';
+    // Empty: the only supply point; with several, never a guess.
+    if (!raw) return known.length === 1 ? known[0] : undefined;
+    if (!/^[A-Za-z0-9]{1,4}$/.test(raw)) return undefined;
+    const matches = known.filter((m) => m.suffix.toUpperCase().endsWith(raw.toUpperCase()));
+    // Two supply points ending alike: never a guess, the contract is not priced.
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
+  /**
+   * The cost of every interval (30 min): its kWh at the mean of its two
+   * quarter prices, taxes included; a negative price costs 0 (a cost is >= 0).
+   * One price unknown: the whole request fails (the core retries later),
+   * never a silent zero. No request: what is held only.
+   */
+  energyPrice({ contract, intervals }) {
+    const m = this.contractPoint(contract?.inputs);
+    if (!m) throw new Error('No Octopus electricity supply point matches this contract');
+    const point = this.freshPoint(m.key);
+    return (intervals ?? []).map(({ starts_at: startsAt, kwh }) => {
+      const t0 = Date.parse(startsAt);
+      const p1 = this.priceFor(m.key, t0, point);
+      const p2 = this.priceFor(m.key, t0 + QUARTER, point);
+      if (!Number.isFinite(t0) || p1 === undefined || p2 === undefined || !finite(kwh) || kwh < 0) {
+        throw new Error(`No Octopus price known for ${startsAt}`);
+      }
+      const cost = Math.max(0, (kwh * (p1 + p2)) / 2);
+      const label = this.labelFor(point, t0);
+      return {
+        starts_at: startsAt,
+        cost: Math.round(cost * 1e8) / 1e8,
+        ...(label ? { label } : {}),
+      };
+    });
+  }
+
+  energyCurrent({ contract }) {
+    const m = this.contractPoint(contract?.inputs);
+    if (!m) return { price: null };
+    const point = this.freshPoint(m.key);
+    // Prices read more than 6 hours ago give no current price (as the features).
+    if (!point) return { price: null };
+    const now = this.now();
+    const q = now - (now % QUARTER);
+    const price = this.priceFor(m.key, q, point);
+    if (price === undefined) return { price: null };
+    const next = this.nextChange(m.key, q, price, point);
+    const label = this.labelFor(point, q);
+    const nextLabel = next ? this.labelFor(point, next.at) : undefined;
+    return {
+      price,
+      valid_until: next ? new Date(next.at).toISOString() : null,
+      next_price: next?.price ?? null,
+      ...(label ? { label } : {}),
+      ...(nextLabel ? { next_label: nextLabel } : {}),
+    };
+  }
+
+  // --- Status ------------------------------------------------------------------------
+
+  async report(gen = this.gen) {
+    if (this.gone(gen)) return;
+    const [connected, message] = this.statusNow();
+    if (this.storeState !== 'ok' && this.storeState !== 'pending') {
+      for (const lang of ['en', 'fr']) message[lang] += t('storage', lang);
+    }
+    for (const lang of ['en', 'fr']) message[lang] = bound(message[lang].trim(), MAX_STATUS);
+    const key = JSON.stringify([connected, message]);
+    if (key === this.lastStatus) return;
+    await this.setStatus(connected, message, key);
+  }
+
+  async setStatus(connected, message, key = JSON.stringify([connected, message])) {
+    try {
+      await this.gladys.setConnectionStatus(connected, message);
+      this.lastStatus = key;
+    } catch (err) {
+      this.log.warn(`Status not sent (${err?.name ?? 'Error'})`);
+    }
+  }
+
+  nextTime() {
+    const wait = Math.max(0, (this.dueMono ?? this.monotonic()) - this.monotonic());
+    // Rounded up: never a time before the read.
+    return clock(this.now() + wait + 999);
+  }
+
+  statusNow() {
+    if (this.config.problem) return [false, both(this.config.problem)];
+    if (!this.idKey && this.idKeyFailures > 0) {
+      // The next try is the next read of the account (5, 10, 20, 40 then every
+      // 60 minutes), never before the key's own spacing: the later of both.
+      const mono = this.monotonic();
+      const wait = Math.max(0, (this.idKeyDue ?? mono) - mono, (this.dueMono ?? mono) - mono);
+      return [false, both('idKeyNotStored', { time: clock(this.now() + wait + 999) })];
+    }
+    if (this.isRefused()) {
+      return [
+        false,
+        this.refused.code === 'api_access'
+          ? both('apiAccess')
+          : both('refused', { code: this.refused.kt ?? 'refused' }),
+      ];
+    }
+    if (this.pauseActive()) {
+      const key =
+        this.pause.code === 'rate_limited'
+          ? 'rateLimited'
+          : this.pause.code === 'login_blocked'
+            ? 'loginBlocked'
+            : this.pause.code === 'login_gone'
+              ? 'loginGone'
+              : 'server';
+      return [
+        false,
+        both(key, { time: clock(this.pause.until), code: this.pause.detail ?? this.pause.code }),
+      ];
+    }
+    if (this.accountProblem) return [false, both(this.accountProblem)];
+    if (!this.account) {
+      return this.lastError
+        ? [false, both('failing', { code: this.lastError, time: this.nextTime() })]
+        : [false, both('starting', { time: this.nextTime() })];
+    }
+    const message = both('connected', { count: this.points.length, time: clock(this.accountOkAt) });
+    const add = (key, values) => {
+      for (const lang of ['en', 'fr']) message[lang] += t(key, lang, values);
+    };
+    if (this.lastError) add('lastFailed', { code: this.lastError, time: this.nextTime() });
+    const noPrices = this.points.filter((m) => !m.prices).length;
+    if (noPrices) add('noPrices', { count: noPrices });
+    if (this.consumptionError === 'several_supply_points' || this.points.length > 1) {
+      add('severalPoints');
+    } else if (this.consumptionError) {
+      add('consumptionFailed', { code: this.consumptionError });
+    }
+    if (this.billingError) add('billingFailed', { code: this.billingError });
+    if (this.account.several) add('severalAccounts');
+    return [!this.lastError, message];
+  }
+
+  // --- Test button ------------------------------------------------------------------------
+
+  /** A login and the list of accounts: lifts a refusal on success. */
+  async testConnection() {
+    if (this.config.problem) return both(this.config.problem);
+    const mono = this.monotonic();
+    if (this.lastTest !== undefined && mono - this.lastTest < TEST_MIN_GAP)
+      return both('testTooSoon');
+    if (this.pauseActive(mono)) return both('testPaused', { time: clock(this.pause.until) });
+    const session = this.session;
+    if (!session) return both('missing');
+    const gen = this.gen;
+    this.lastTest = mono;
+    let message;
+    try {
+      const { data } = await session.request(ACCOUNTS);
+      if (this.gone(gen)) return both('testFailed', { code: 'restarted' });
+      message = both('testOk', { count: parseAccounts(data).length });
+      await this.clearPause();
+      if (this.refused) {
+        this.refused = undefined;
+        this.data.refused = null;
+        await this.save();
+      }
+      if (!this.gone(gen) && !this.roundTimer) this.schedule(gen);
+    } catch (err) {
+      if (this.gone(gen)) return both('testFailed', { code: 'restarted' });
+      const code = err instanceof KrakenError ? err.code : 'bad_response';
+      if (code === 'refused' || code === 'api_access') {
+        await this.refuse(err);
+        message =
+          code === 'api_access'
+            ? both('apiAccess')
+            : both('refused', { code: err.kt ?? 'refused' });
+      } else if (PAUSING.has(code)) {
+        await this.setPause(err);
+        message = both('testPaused', { time: clock(this.pause.until) });
+      } else {
+        message = both('testFailed', { code: codeOf(err) });
+      }
+    }
+    await this.report(gen);
+    return message;
+  }
+}
