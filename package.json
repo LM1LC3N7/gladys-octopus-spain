@@ -1,6 +1,6 @@
 {
   "name": "gladys-octopus-spain",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Octopus Energy España for Gladys Assistant: the prices of your contract by 2.0TD period, the hourly consumption, the balances and the last bill, read from the official Kraken API with your account. Read-only. Unofficial, not affiliated with Octopus Energy.",
   "type": "module",
