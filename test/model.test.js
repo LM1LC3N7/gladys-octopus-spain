@@ -172,6 +172,8 @@ test('billing: balances and the last bill in EUR; missing ones stay unknown, nev
     K.billing({ bills: [{ node: { issuedDate: '2026-10-05', grossAmount: null } }] }).data,
   );
   assert.equal(noAmount.bill, undefined);
+  const negative = parseBilling(K.billing({ amount: '-500' }).data);
+  assert.equal(negative.bill, undefined, 'a negative bill is not a bill');
   assert.deepEqual(parseBilling(null), { credit: undefined, wallet: undefined, bill: undefined });
 });
 

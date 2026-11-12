@@ -92,8 +92,8 @@
   {
     "name": "stale prices published",
     "file": "src/app.js",
-    "from": "      this.monotonic() - this.accountOkMono > PRICES_MAX_AGE",
-    "to": "      false"
+    "from": "if (!m || m.readAt === undefined || this.monotonic() - m.readAt > PRICES_MAX_AGE) {",
+    "to": "if (!m) {"
   },
   {
     "name": "unknown price priced as 0",
@@ -436,5 +436,53 @@
     "file": "src/config.js",
     "from": "if (!config.problem && zoneGiven && !Object.values(ZONES).includes(raw.zone)) {",
     "to": "if (false) {"
+  },
+  {
+    "name": "r1 R3 negative kWh priced",
+    "file": "src/app.js",
+    "from": "!finite(kwh) || kwh < 0)",
+    "to": "!finite(kwh))"
+  },
+  {
+    "name": "r1 R4 second quarter price unchecked",
+    "file": "src/app.js",
+    "from": "p1 === undefined || p2 === undefined ||",
+    "to": "p1 === undefined ||"
+  },
+  {
+    "name": "r1 R8 403 triggers a new login",
+    "file": "src/kraken/client.js",
+    "from": "!(err.code === 'unauthorized' && err.status === 401)",
+    "to": "!(err.code === 'unauthorized' && (err.status === 401 || err.status === 403))"
+  },
+  {
+    "name": "r1 R11 negative bill taken",
+    "file": "src/kraken/model.js",
+    "from": "amount !== undefined && amount >= 0",
+    "to": "amount !== undefined"
+  },
+  {
+    "name": "r1 I1 an old copy recorded in /data",
+    "file": "src/app.js",
+    "from": "this.recordPrices(this.points.filter((m) => m.readAt === readAt));",
+    "to": "this.recordPrices(this.points);"
+  },
+  {
+    "name": "r1 I1 freshness from the account read, not the point",
+    "file": "src/app.js",
+    "from": "if (!m || m.readAt === undefined || this.monotonic() - m.readAt > PRICES_MAX_AGE) {",
+    "to": "if (!m || this.monotonic() - this.accountOkMono > PRICES_MAX_AGE) {"
+  },
+  {
+    "name": "r1 I1 a point in error takes the new read time",
+    "file": "src/app.js",
+    "from": "m.broken ? this.points.find((x) => x.key === m.key) : { ...m, readAt, readWall },",
+    "to": "m.broken ? { ...this.points.find((x) => x.key === m.key), readAt, readWall } : { ...m, readAt, readWall },"
+  },
+  {
+    "name": "r1 I1 status silent on a point in error",
+    "file": "src/app.js",
+    "from": "    if (stale.length) {",
+    "to": "    if (false) {"
   }
 ]

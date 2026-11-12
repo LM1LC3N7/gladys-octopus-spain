@@ -87,14 +87,26 @@ taxes included. The API gives the prices in force, never their dates: the
 integration keeps, at each hourly read, the prices of the next 2 hours (40
 days kept). So:
 
-- start the contract on the day the integration is installed: an earlier
-  half hour has no price;
-- a Gladys stopped more than 2 hours leaves the half hours of the gap without
-  a price;
-- a price change is seen at the next hourly read.
+- start the contract on the day **after** the installation: a half hour
+  before the installation has no price;
+- a gap of more than 2 hours without a good read leaves the half hours of
+  the gap without a price: Gladys stopped, Octopus unreachable for about
+  1 h 30 (the retries after 5, 10, 20 and 40 minutes then fall after the
+  2 hours kept), a pause after a 429 or a 5xx longer than 2 hours, or a
+  supply point whose prices the API answers in error;
+- a price change is seen at the next hourly read;
+- changing the zone does not price the past again.
 
-A half hour without a price is never counted 0: the request fails and Gladys
-tries again later.
+A half hour without a price is never counted 0. Gladys needs a price for
+every half hour of a request: one missing fails the whole request, and the
+catch-up of Gladys starts again from the oldest half hour without a cost. A
+gap therefore delays the costs of the half hours after it, for up to 31 days
+(the catch-up window of Gladys), until the gap leaves that window. The
+priced half hours carry no period label.
+
+The template uses the time of Madrid for the days and months of Gladys
+(billing period, daily totals): in the Canary Islands they start at 23:00
+local time. The periods themselves follow the local time of the islands.
 
 ## Status and errors
 
@@ -113,7 +125,9 @@ refused password: one new login, then a passing error. The pauses and the
 refusal are kept in `/data` (the refusal as 8 bits of a salted hash of the
 credentials, never the credentials).
 
-Other remarks in the status: prices not given with taxes (not published nor
+Other remarks in the status: the prices of a supply point answered in error
+(the error and the time of the last good read; not kept, not used after 6
+hours), prices not given with taxes (not published nor
 used), several supply points (the consumption is not published), the
 balances or the consumption not read (the prices go on).
 

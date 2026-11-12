@@ -92,13 +92,27 @@ comprises. L'API donne les prix en vigueur, jamais leurs dates : à chaque
 lecture horaire, l'intégration garde les prix des 2 heures suivantes (gardés
 40 jours). Donc :
 
-- faites commencer le contrat le jour de l'installation de l'intégration :
-  une demi-heure antérieure n'a pas de prix ;
-- un Gladys arrêté plus de 2 heures laisse les demi-heures du trou sans prix ;
-- un changement de prix est vu à la lecture horaire suivante.
+- faites commencer le contrat le **lendemain** de l'installation : une
+  demi-heure d'avant l'installation n'a pas de prix ;
+- plus de 2 heures sans bonne lecture laissent les demi-heures du trou sans
+  prix : Gladys arrêté, Octopus injoignable environ 1 h 30 (les reprises à 5,
+  10, 20 et 40 minutes tombent alors après les 2 heures gardées), une pause
+  après un 429 ou un 5xx de plus de 2 heures, ou un point de fourniture dont
+  l'API renvoie les prix en erreur ;
+- un changement de prix est vu à la lecture horaire suivante ;
+- changer de zone ne retarife pas le passé.
 
-Une demi-heure sans prix n'est jamais comptée 0 : la requête échoue et Gladys
-réessaie plus tard.
+Une demi-heure sans prix n'est jamais comptée 0. Gladys exige un prix pour
+chaque demi-heure d'une requête : un seul manquant fait échouer toute la
+requête, et le rattrapage de Gladys reprend depuis la plus ancienne
+demi-heure sans coût. Un trou retarde donc les coûts des demi-heures
+suivantes, jusqu'à 31 jours (la fenêtre de rattrapage de Gladys), le temps
+que le trou sorte de cette fenêtre. Les demi-heures tarifées ne portent pas
+d'étiquette de période.
+
+Le modèle utilise l'heure de Madrid pour les jours et les mois de Gladys
+(période de facturation, totaux du jour) : aux Canaries, ils commencent à
+23 h locale. Les périodes, elles, suivent l'heure locale des îles.
 
 ## Statut et erreurs
 
@@ -122,7 +136,9 @@ mais que l'intégration le dit refusé, votre compte utilise peut-être la
 nouvelle connexion : une clé d'API du compte fonctionne encore (demandez-en
 une à Octopus).
 
-Autres remarques du statut : prix non donnés taxes comprises (ni publiés ni
+Autres remarques du statut : prix d'un point de fourniture renvoyés en erreur
+(l'erreur et l'heure de la dernière bonne lecture ; ni gardés, ni utilisés
+après 6 heures), prix non donnés taxes comprises (ni publiés ni
 utilisés), plusieurs points de fourniture (la consommation n'est pas
 publiée), soldes ou consommation non lus (les prix continuent).
 

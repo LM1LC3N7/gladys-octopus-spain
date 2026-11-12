@@ -9,8 +9,9 @@
 - [ ] Add the `gladys-assistant-integration` topic to publish in the store
       (after the first release: the store validator needs the GHCR image).
 - [ ] Store fields left out of the manifest on purpose (Louis' rule):
-      `countries: ["ES"]`, keywords `octopus`, `kraken`, `2.0TD`, `CUPS`,
-      `Solar Wallet`.
+      keywords `octopus`, `kraken`, `2.0TD`, `CUPS`, `Solar Wallet`
+      (`countries: ["ES"]` is in the manifest since Louis' rule of
+      2026-11-12).
 
 ## To confirm on a real account (built without one)
 
@@ -37,8 +38,10 @@
 
 - **Version 0.1.0** set by hand (package, lock, manifest, image tag) when
   leaving the template; the Release workflow owns it from now on.
-- **`gladys_version: ">=5.2.0"`**, not 5.1.0: `publishEnergyConsumption`
-  and the energy contracts arrived in Gladys 5.2.0.
+- **`gladys_version: ">=5.3.0"`** and **`countries: ["ES"]`** (Louis'
+  rule of 2026-11-12: a module serving one country declares it, which needs
+  Gladys 5.3.0; `publishEnergyConsumption` and the energy contracts need
+  5.2.0 anyway).
 - **Base**: the code of gladys-octopus-germany (same Kraken platform, same
   author): client, login, refusal, pauses, id key, /data, test button. The
   Spanish queries come from ha-octopus-spain (MIT, notice kept); its
@@ -46,14 +49,18 @@
   the CNMC Circular 3/2020.
 - **Read-only (v1)**: no meter reading, no preference changed. The only
   mutation is the login.
-- **2.0TD periods** (`src/tariff.js`): weekdays P1 10-14 and 18-22, P2 8-10,
-  14-18, 22-24, P3 0-8 (Ceuta and Melilla an hour later), in the local time
+- **2.0TD periods** (`src/tariff.js`): weekdays P3 0-8 everywhere; P1 10-14
+  and 18-22, P2 8-10, 14-18 and 22-24 (Ceuta and Melilla: P1 11-15 and
+  19-23, P2 8-11, 15-19 and 23-24), in the local time
   of the zone chosen in the form (peninsula and Balearic Islands, Canary
   Islands, Ceuta and Melilla); Saturdays, Sundays and the national holidays
   of fixed date (1/1, 6/1, 1/5, 15/8, 12/10, 1/11, 6/12, 8/12, 25/12) P3 all
   day. Moving and regional holidays are not P3 in 2.0TD (CNMC). An unknown
   zone value in the form is refused (nothing sent), never taken as the
-  peninsula. The status times are those of Madrid.
+  peninsula. The status times are those of Madrid. The template declares
+  `Europe/Madrid`: in the Canary Islands, the days and months of the core
+  (billing period, daily totals) start at 23:00 local; the periods are
+  computed in the local time of the islands all the same (documented).
 - **One delegated template, no calendar.** The prices are the customer's
   own (they change with the product and its updates): no rule could carry
   them. The fixed charges (power term, meter rental) are a `fixed` component
@@ -68,8 +75,14 @@
   contract starting before the installation, or a Gladys stopped longer
   than 2 hours, leaves intervals unpriced (the request fails, the core
   retries; never a silent zero). A price change is seen at the next hourly
-  read. A negative cost is 0. The label of a priced interval is its period
-  (`P1`, `P2`, `P3`), none for a single-price product.
+  read. A negative cost is 0. A priced interval carries no label (its period
+  then is not kept: a zone changed since would label it otherwise; the same
+  request always gets the same answer); the current price carries its
+  period (`P1`, `P2`, `P3`), none for a single-price product.
+- **A supply point in error** (a GraphQL error whose path points at it, review
+  r1): it keeps the copy and the time of its last good read; its prices are
+  never recorded again in /data, no longer published nor served after 6 hours,
+  and the status names the error and the time of the last good read.
 - **Consumption**: the hourly readings (`timeGranularity: HOUR`), each hour
   published as two equal half hours (the hour total is exact; the 2.0TD
   period never changes inside an hour, so its cost is exact too). Read

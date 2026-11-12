@@ -297,3 +297,29 @@ test('session: one request at a time, the gap after the end of the previous one'
   s.close();
   await failsWith(s.request(ACCOUNTS), 'stopped');
 });
+
+test('r1 I2: a refresh token refused with KT-CT-1138 is no refusal: the credentials log in', async () => {
+  const kraken = createKraken();
+  const { s, clock } = session(kraken);
+  await s.request(ACCOUNTS);
+  kraken.answers.token = (call) =>
+    call.variables.input.refreshToken ? K.ktError('KT-CT-1138') : K.token();
+  clock.now = 56 * 60_000;
+  const { data } = await s.request(ACCOUNTS);
+  assert.equal(data.viewer.accounts.length, 1);
+  assert.deepEqual(
+    kraken.calls.slice(2).map((c) => [c.op, Object.keys(c.variables.input ?? {}).join()]),
+    [
+      ['token', 'refreshToken'],
+      ['token', 'email,password'],
+      ['accounts', ''],
+    ],
+  );
+});
+
+test('r1 M4: a 403 of a query is passing, with no new login', async () => {
+  const kraken = createKraken({ accounts: () => new Response('{}', { status: 403 }) });
+  await failsWith(session(kraken).s.request(ACCOUNTS), 'unauthorized');
+  assert.equal(kraken.count('token'), 1);
+  assert.equal(kraken.count('accounts'), 1);
+});

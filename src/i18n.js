@@ -104,6 +104,10 @@ const TEXTS = {
     en: ' The consumption could not be read ({code}).',
     fr: ' La consommation n’a pas pu être lue ({code}).',
   },
+  pricesNotRead: {
+    en: ' The prices of {count} supply point(s) could not be read ({code}): last good read at {time}, not used after 6 hours nor kept for the contract.',
+    fr: ' Les prix de {count} point(s) de fourniture n’ont pas pu être lus ({code}) : dernière lecture bonne à {time}, plus utilisés après 6 heures ni gardés pour le contrat.',
+  },
   noPrices: {
     en: ' The prices of {count} supply point(s) were not given with taxes: they are not published nor used.',
     fr: ' Les prix de {count} point(s) de fourniture n’ont pas été donnés taxes comprises : ni publiés ni utilisés.',

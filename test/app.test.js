@@ -671,12 +671,12 @@ test('delegated pricing: the past from the prices kept then, the current quarter
   ]);
   assert.equal(ack.success, true, ack.error);
   assert.deepEqual(
-    ack.data.costs.map((c) => [c.cost, c.label]),
-    [
-      [0.402468, 'P1'],
-      [0.151234, 'P2'],
-      [0.151234, 'P2'],
-    ],
+    ack.data.costs.map((c) => c.cost),
+    [0.402468, 0.151234, 0.151234],
+  );
+  assert.ok(
+    ack.data.costs.every((c) => c.label === undefined),
+    'no label: the period then is not kept',
   );
   // Before the installation: never priced from today's prices.
   const before = await price(env, [interval('2026-11-04T08:00:00.000Z')]);
@@ -943,4 +943,59 @@ test('mutants: balances read more than 6 hours ago are not published again', asy
   before = count();
   await env.wait(15 * MINUTE);
   assert.equal(count(), before, 'read 7 h ago: not published');
+});
+
+test('r1 I1: a supply point in error for 7 hours: no current price, nothing new kept, the past still priced, the status says it', async (t) => {
+  const env = await started();
+  t.after(() => env.app.stop());
+  await env.fake.deviceCreated(cupsDevice(env));
+  await env.wait(HOUR + 1000); // 11:07: a good read keeps up to 13:00
+  const lastKept = Math.max(...Object.keys(env.store.data.prices[KEY]).map(Number));
+  env.kraken.answers.account = () => ({
+    ...K.account({ points: [K.point({ withTaxes: ['0.9', '0.9', '0.9'] })] }),
+    errors: [
+      {
+        message: 'x',
+        path: ['account', 'properties', 0, 'electricitySupplyPoints', 0, 'activeAgreement'],
+      },
+    ],
+  });
+  await env.wait(HOUR);
+  assert.match(
+    statusText(env),
+    /prices of 1 supply point\(s\) could not be read \(error\): last good read at 11:0\d/,
+  );
+  await env.wait(6 * HOUR);
+  const current = await env.fake.energyCurrent({ contract: { id: 'c', inputs: {} } });
+  assert.equal(current.data.price, null, 'never served as fresh');
+  assert.equal(
+    Math.max(...Object.keys(env.store.data.prices[KEY]).map(Number)),
+    lastKept,
+    'no quarter kept from an old read',
+  );
+  assert.ok(!Object.values(env.store.data.prices[KEY]).includes(0.9));
+  const past = await price(env, [interval('2026-11-04T10:00:00.000Z')]);
+  assert.equal(past.data.costs[0].cost, 0.201234, 'the past from what was kept');
+  const gap = await price(env, [interval('2026-11-04T14:00:00.000Z')]);
+  assert.equal(gap.success, false, 'the hours of the error have no price');
+  env.gladys.forgetPublishedStates();
+  const before = env.fake.states.length;
+  await env.wait(15 * MINUTE);
+  assert.equal(
+    env.fake.states.filter((s) => s.device_feature_external_id === F('price')).length,
+    env.fake.states.slice(0, before).filter((s) => s.device_feature_external_id === F('price'))
+      .length,
+    'the price feature not published',
+  );
+});
+
+test('r1 I2: a negative kWh and a half hour whose second quarter has no price are refused', async (t) => {
+  const env = await started();
+  t.after(() => env.app.stop());
+  env.kraken.answers.accounts = () => 'network';
+  await env.wait(7 * HOUR); // the last quarter kept is 12:00; 12:15 has no price
+  const ok = await price(env, [interval('2026-11-04T10:30:00.000Z')]);
+  assert.equal(ok.success, true, ok.error);
+  assert.equal((await price(env, [interval('2026-11-04T10:30:00.000Z', -1)])).success, false);
+  assert.equal((await price(env, [interval('2026-11-04T11:00:00.000Z')])).success, false);
 });

@@ -860,6 +860,7 @@ export class OctopusApp {
       return;
     }
     let points;
+    let readAt;
     try {
       const { data, errors } = await session.request(ACCOUNT, { accountNumber: number });
       // An answer with errors is passing: what was read before is kept,
@@ -871,8 +872,16 @@ export class OctopusApp {
       if (parts) this.log.warn(`Part of the account not read (${ktOf(errors) ?? 'error'})`);
       points = parseAccount(data, this.idKey, parts);
       if (!points) throw new KrakenError('bad_response');
+      // A point read in this answer carries the time of this read; a point
+      // an error points at keeps the copy (and the time) of its last good
+      // read, so its prices age and are never recorded again.
+      readAt = this.monotonic();
+      const readWall = this.now();
+      this.pointError = parts ? (ktOf(errors) ?? 'error') : undefined;
       points = points
-        .map((m) => (m.broken ? this.points.find((x) => x.key === m.key) : m))
+        .map((m) =>
+          m.broken ? this.points.find((x) => x.key === m.key) : { ...m, readAt, readWall },
+        )
         .filter(Boolean);
     } catch (err) {
       this.failures += 1;
@@ -885,8 +894,8 @@ export class OctopusApp {
     this.account = { number, several: !wanted && numbers.length > 1 };
     this.points = points;
     this.accountOkAt = this.now();
-    this.accountOkMono = this.monotonic();
-    this.recordPrices();
+    this.accountOkMono = readAt;
+    this.recordPrices(this.points.filter((m) => m.readAt === readAt));
     // The account device: its key (an HMAC, nothing to find the number back from) kept in /data.
     this.data.accountKey = keyOf(this.idKey, 'account', number);
     // Secondary read: a failure keeps what was known, never blocks the prices.
@@ -919,12 +928,13 @@ export class OctopusApp {
   /**
    * The prices of the quarters from the current one to PRICE_AHEAD, kept in
    * /data (the API never dates its prices: never further, never the past).
-   * A quarter already started keeps the price kept for it.
+   * A quarter already started keeps the price kept for it. Only the points
+   * read in this answer (`points`): an older copy never enters /data.
    */
-  recordPrices() {
+  recordPrices(points) {
     const now = this.now();
     const zone = this.config.zone;
-    for (const m of this.points) {
+    for (const m of points) {
       if (!m.prices) continue;
       const kept = this.data.prices[m.key] ?? {};
       for (let q = now - (now % QUARTER); q < now + PRICE_AHEAD; q += QUARTER) {
@@ -1085,15 +1095,13 @@ export class OctopusApp {
     await this.publishDiscovery(this.gen);
   }
 
-  /** The supply point of a key, when its prices were read recently enough in this process. */
+  /** The supply point of a key, when its own prices were read recently enough in this process. */
   freshPoint(key) {
-    if (
-      this.accountOkMono === undefined ||
-      this.monotonic() - this.accountOkMono > PRICES_MAX_AGE
-    ) {
+    const m = this.points.find((x) => x.key === key && x.prices);
+    if (!m || m.readAt === undefined || this.monotonic() - m.readAt > PRICES_MAX_AGE) {
       return undefined;
     }
-    return this.points.find((m) => m.key === key && m.prices);
+    return m;
   }
 
   /**
@@ -1208,12 +1216,10 @@ export class OctopusApp {
         throw new Error(`No Octopus price known for ${startsAt}`);
       }
       const cost = Math.max(0, (kwh * (p1 + p2)) / 2);
-      const label = this.labelFor(point, t0);
-      return {
-        starts_at: startsAt,
-        cost: Math.round(cost * 1e8) / 1e8,
-        ...(label ? { label } : {}),
-      };
+      // No label: a past interval is priced from what was kept, and its
+      // period then is not kept (a zone changed since would give another
+      // one); the same request always gets the same answer.
+      return { starts_at: startsAt, cost: Math.round(cost * 1e8) / 1e8 };
     });
   }
 
@@ -1310,6 +1316,15 @@ export class OctopusApp {
       for (const lang of ['en', 'fr']) message[lang] += t(key, lang, values);
     };
     if (this.lastError) add('lastFailed', { code: this.lastError, time: this.nextTime() });
+    const stale = this.points.filter((m) => m.readAt !== this.accountOkMono);
+    if (stale.length) {
+      const last = Math.min(...stale.map((m) => m.readWall ?? this.accountOkAt));
+      add('pricesNotRead', {
+        count: stale.length,
+        code: this.pointError ?? 'error',
+        time: clock(last),
+      });
+    }
     const noPrices = this.points.filter((m) => !m.prices).length;
     if (noPrices) add('noPrices', { count: noPrices });
     if (this.consumptionError === 'several_supply_points' || this.points.length > 1) {

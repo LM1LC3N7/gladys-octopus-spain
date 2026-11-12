@@ -12,6 +12,7 @@ the notes of the version's GitHub Release.
 
 ### Added
 
+- `countries: ["ES"]` in the manifest (Gladys 5.3.0 or later).
 - First version: the Octopus Energy España account read through the official
   Kraken GraphQL API (e-mail and password, or an API key of the account),
   read-only.
